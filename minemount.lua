@@ -46,6 +46,7 @@ local State = {
     dragStart         = nil,
     dragPos           = nil,
     upgradeSpamRunning = false,
+    blacklist         = {},
     guiVisible        = true,
     connections       = {},
     godConnection     = nil,
@@ -217,7 +218,7 @@ local function MineAndGrab(ore)
     local char    = LocalPlayer.Character
     local tool    = char and char:FindFirstChildOfClass("Tool")
 
-    while ore.Parent and (os.clock() - start) < Config.MineMaxTime do
+    while not IsOreGone(ore) and (os.clock() - start) < Config.MineMaxTime do
         -- keep locked onto the rock so the touch/grab registers
         TeleportToRock(ore)
 
@@ -235,11 +236,15 @@ local function MineAndGrab(ore)
             Fire("break", ore); Fire("harvest", ore)
         end
 
-        task.wait(0.08)
+        -- check often so we move on the instant the grab finishes
+        for _ = 1, 4 do
+            if IsOreGone(ore) then break end
+            task.wait(0.03)
+        end
     end
 
-    -- returns true if the rock was fully mined/collected
-    return ore.Parent == nil
+    -- returns true if the rock was fully grabbed/mined (not just timed out)
+    return IsOreGone(ore)
 end
 
 ----------------------------------------------------------------------
@@ -396,9 +401,24 @@ task.spawn(function()
         local ok = pcall(function()
             if Config.AutoMine then
                 local ores = GetMineableOres()
-                if #ores > 0 then
-                    table.sort(ores, function(a, b) return GetValue(a) > GetValue(b) end)
-                    MineAndGrab(ores[1])
+                -- skip rocks we just failed to mine (short cooldown) so a
+                -- stubborn rock doesn't block the rest
+                local now = os.clock()
+                local target
+                table.sort(ores, function(a, b) return GetValue(a) > GetValue(b) end)
+                for _, ore in ipairs(ores) do
+                    local until_ = State.blacklist[ore]
+                    if not until_ or now > until_ then
+                        target = ore
+                        break
+                    end
+                end
+                if target then
+                    local grabbed = MineAndGrab(target)
+                    if not grabbed then
+                        -- timed out on this rock, ignore it for a few seconds
+                        State.blacklist[target] = os.clock() + 5
+                    end
                 end
             end
 
