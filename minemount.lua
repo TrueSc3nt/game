@@ -31,6 +31,7 @@ local Config = {
     FastMine       = true,
     MineSpeedFast  = 50,   -- activations per tick when FastMine is on
     MineSpeedSlow  = 8,    -- activations per tick when FastMine is off
+    MineMaxTime    = 6,    -- max seconds to stay on one rock before giving up
     ESP            = true,
     ShowValueOnESP = true,
     AntiFreeze     = true,
@@ -176,39 +177,69 @@ local function CurrentMineSpeed()
     return Config.FastMine and Config.MineSpeedFast or Config.MineSpeedSlow
 end
 
-local function MineAndGrab(ore)
+-- Detect when a rock/crystal has been grabbed & mined. Games handle this
+-- differently, so we check the common signals: destroyed, un-parented,
+-- made invisible, or made non-collidable.
+local function IsOreGone(ore)
+    if not ore then return true end
+    if not ore.Parent then return true end
+    if not ore:IsDescendantOf(Workspace) then return true end
+    if ore.Transparency >= 1 then return true end
+    if ore:IsA("BasePart") and ore.CanCollide == false and ore.Transparency > 0.9 then
+        return true
+    end
+    return false
+end
+
+local function TryGrab(ore)
     if not ore or not ore.Parent then return end
+    pcall(function()
+        local hrp = GetHRP()
+        if hrp and typeof(firetouchinterest) == "function" then
+            firetouchinterest(hrp, ore, 0)
+            task.wait(0.02)
+            firetouchinterest(hrp, ore, 1)
+        end
+    end)
+    Fire("pickup", ore); Fire("collect", ore); Fire("grab", ore)
+end
+
+-- TP to the rock, then mine + grab it repeatedly until it's collected (gone)
+-- or until MineMaxTime seconds pass, so we never get stuck on one rock.
+local function MineAndGrab(ore)
+    if not ore or not ore.Parent then return false end
+
     TeleportToRock(ore)
     task.wait(0.05)
 
-    local speed = CurrentMineSpeed()
+    local speed   = CurrentMineSpeed()
+    local start   = os.clock()
+    local char    = LocalPlayer.Character
+    local tool    = char and char:FindFirstChildOfClass("Tool")
 
-    local char = LocalPlayer.Character
-    local tool = char and char:FindFirstChildOfClass("Tool")
-    if tool then
-        for _ = 1, speed do pcall(function() tool:Activate() end) end
-    end
+    while ore.Parent and (os.clock() - start) < Config.MineMaxTime do
+        -- keep locked onto the rock so the touch/grab registers
+        TeleportToRock(ore)
 
-    for _ = 1, speed do
-        Fire("mine", ore); Fire("dig", ore); Fire("hit", ore)
-        Fire("break", ore); Fire("harvest", ore)
-    end
+        -- GRAB FIRST: in this game grabbing the rock is what mines it,
+        -- and it then goes straight into the backpack.
+        TryGrab(ore)
 
-    if Config.AutoCollect then
-        for _ = 1, 14 do
-            if not ore.Parent then break end
-            pcall(function()
-                local hrp = GetHRP()
-                if hrp and typeof(firetouchinterest) == "function" then
-                    firetouchinterest(hrp, ore, 0)
-                    task.wait(0.025)
-                    firetouchinterest(hrp, ore, 1)
-                end
-            end)
-            Fire("pickup", ore); Fire("collect", ore)
-            task.wait(0.18)
+        -- back it up with tool activation + mine remotes in case the
+        -- game also needs a hit to release the rock
+        if tool then
+            for _ = 1, speed do pcall(function() tool:Activate() end) end
         end
+        for _ = 1, speed do
+            Fire("mine", ore); Fire("dig", ore); Fire("hit", ore)
+            Fire("break", ore); Fire("harvest", ore)
+        end
+
+        task.wait(0.08)
     end
+
+    -- returns true if the rock was fully mined/collected
+    return ore.Parent == nil
 end
 
 ----------------------------------------------------------------------
