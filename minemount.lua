@@ -1,4 +1,4 @@
---[[ MINE A MOUNTAIN BOT v11 - Cleaned + Fixed ]]
+--[[ MINE A MOUNTAIN BOT v12 - Movement Exploits ]]
 
 local Players            = game:GetService("Players")
 local RunService         = game:GetService("RunService")
@@ -37,6 +37,18 @@ local Config = {
     AntiFreeze     = true,
     GodMode        = false,
     AutoUpgrade    = false,
+
+    -- movement / positioning
+    StayOnRock     = true,   -- lock in place while mining so you don't slide off
+    AntiFall       = true,   -- kill fall damage + stop free-falling down the mountain
+    NoClip         = false,  -- walk / fly through the mountain and rocks
+    Fly            = false,  -- free fly with WASD + Space/Ctrl
+    FlySpeed       = 80,
+    InfiniteJump   = false,
+    WalkSpeedOn    = false,
+    WalkSpeed      = 60,
+    JumpPower      = 50,
+    AutoSellFull   = true,   -- auto sell when backpack is full
 }
 
 local State = {
@@ -50,6 +62,11 @@ local State = {
     guiVisible        = true,
     connections       = {},
     godConnection     = nil,
+    noclipConnection  = nil,
+    flyConnection     = nil,
+    flyParts          = {},
+    heldKeys          = {},
+    lockPos           = nil,   -- CFrame we hold when StayOnRock is active
 }
 
 local function TrackConn(conn)
@@ -105,6 +122,11 @@ local function GetHRP()
     return c and c:FindFirstChild("HumanoidRootPart")
 end
 
+local function GetHumanoid()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
 local function SetVelocity(part, vel)
     if not part then return end
     pcall(function() part.AssemblyLinearVelocity = vel end)
@@ -115,6 +137,8 @@ local function TeleportToRock(ore)
     if hrp and ore and ore.Parent then
         hrp.CFrame = ore.CFrame * CFrame.new(0, 4.8, 0)
         SetVelocity(hrp, Vector3.zero)
+        -- remember this spot so StayOnRock can hold us here
+        State.lockPos = hrp.CFrame
     end
 end
 
@@ -296,6 +320,193 @@ local function DisableGodMode()
 end
 
 ----------------------------------------------------------------------
+-- NOCLIP (walk / fly / teleport through the mountain and rocks)
+----------------------------------------------------------------------
+local function EnableNoClip()
+    if State.noclipConnection then return end
+    State.noclipConnection = RunService.Stepped:Connect(function()
+        if not Config.NoClip then return end
+        local char = LocalPlayer.Character
+        if not char then return end
+        for _, p in ipairs(char:GetDescendants()) do
+            if p:IsA("BasePart") and p.CanCollide then
+                p.CanCollide = false
+            end
+        end
+    end)
+    TrackConn(State.noclipConnection)
+end
+
+local function DisableNoClip()
+    if State.noclipConnection then
+        State.noclipConnection:Disconnect()
+        State.noclipConnection = nil
+    end
+end
+
+----------------------------------------------------------------------
+-- FLY (WASD + Space up / Ctrl down, camera-relative)
+----------------------------------------------------------------------
+local function DestroyFlyParts()
+    for _, obj in ipairs(State.flyParts) do
+        pcall(function() obj:Destroy() end)
+    end
+    State.flyParts = {}
+end
+
+local function EnableFly()
+    local hrp = GetHRP()
+    local hum = GetHumanoid()
+    if not hrp or not hum then return end
+
+    DestroyFlyParts()
+
+    local bv = Instance.new("BodyVelocity")
+    bv.MaxForce = Vector3.new(1, 1, 1) * math.huge
+    bv.Velocity = Vector3.zero
+    bv.Parent = hrp
+
+    local bg = Instance.new("BodyGyro")
+    bg.MaxForce = Vector3.new(1, 1, 1) * math.huge
+    bg.P = 9e4
+    bg.CFrame = hrp.CFrame
+    bg.Parent = hrp
+
+    State.flyParts = { bv, bg }
+    pcall(function() hum.PlatformStand = true end)
+
+    if State.flyConnection then State.flyConnection:Disconnect() end
+    State.flyConnection = RunService.RenderStepped:Connect(function()
+        if not Config.Fly then return end
+        local cam = Workspace.CurrentCamera
+        if not cam or not hrp or not hrp.Parent then return end
+
+        local dir = Vector3.zero
+        local look = cam.CFrame.LookVector
+        local right = cam.CFrame.RightVector
+        if State.heldKeys[Enum.KeyCode.W] then dir += look end
+        if State.heldKeys[Enum.KeyCode.S] then dir -= look end
+        if State.heldKeys[Enum.KeyCode.D] then dir += right end
+        if State.heldKeys[Enum.KeyCode.A] then dir -= right end
+        if State.heldKeys[Enum.KeyCode.Space] then dir += Vector3.yAxis end
+        if State.heldKeys[Enum.KeyCode.LeftControl] then dir -= Vector3.yAxis end
+
+        if dir.Magnitude > 0 then dir = dir.Unit end
+        bv.Velocity = dir * Config.FlySpeed
+        bg.CFrame = cam.CFrame
+    end)
+    TrackConn(State.flyConnection)
+end
+
+local function DisableFly()
+    if State.flyConnection then
+        State.flyConnection:Disconnect()
+        State.flyConnection = nil
+    end
+    DestroyFlyParts()
+    local hum = GetHumanoid()
+    if hum then pcall(function() hum.PlatformStand = false end) end
+end
+
+----------------------------------------------------------------------
+-- STAY ON ROCK + ANTI-FALL (don't slide down the mountain)
+----------------------------------------------------------------------
+local function StayOnRockStep()
+    if Config.Fly then return end        -- flying overrides positioning
+    local hrp = GetHRP()
+    if not hrp then return end
+
+    -- Hard lock in place while auto-mining a rock
+    if Config.StayOnRock and Config.AutoMine and State.lockPos then
+        hrp.CFrame = State.lockPos
+        SetVelocity(hrp, Vector3.zero)
+        return
+    end
+
+    -- Anti-fall: if free-falling fast down the mountain, kill the drop
+    if Config.AntiFall then
+        local vel = hrp.AssemblyLinearVelocity
+        if vel.Y < -55 then
+            SetVelocity(hrp, Vector3.new(vel.X, 0, vel.Z))
+        end
+    end
+end
+
+local function EnableAntiFallDamage()
+    local hum = GetHumanoid()
+    if not hum then return end
+    pcall(function()
+        hum.StateChanged:Connect(function(_, new)
+            if Config.AntiFall and new == Enum.HumanoidStateType.Landed then
+                SetVelocity(GetHRP(), Vector3.zero)
+            end
+        end)
+    end)
+end
+
+----------------------------------------------------------------------
+-- SPEED / JUMP TWEAKS
+----------------------------------------------------------------------
+local function ApplyCharTweaks()
+    local hum = GetHumanoid()
+    if not hum then return end
+    pcall(function()
+        if Config.WalkSpeedOn then
+            hum.WalkSpeed = Config.WalkSpeed
+        end
+        if Config.JumpPower and Config.JumpPower ~= 50 then
+            hum.UseJumpPower = true
+            hum.JumpPower = Config.JumpPower
+        end
+    end)
+end
+
+----------------------------------------------------------------------
+-- INPUT (fly keys + infinite jump) + MOVEMENT LOOP
+----------------------------------------------------------------------
+TrackConn(UserInputService.InputBegan:Connect(function(input, gpe)
+    if input.KeyCode ~= Enum.KeyCode.Unknown then
+        State.heldKeys[input.KeyCode] = true
+    end
+    if gpe then return end
+    -- infinite jump
+    if input.KeyCode == Enum.KeyCode.Space and Config.InfiniteJump then
+        local hum = GetHumanoid()
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end
+end))
+
+TrackConn(UserInputService.InputEnded:Connect(function(input)
+    if input.KeyCode ~= Enum.KeyCode.Unknown then
+        State.heldKeys[input.KeyCode] = nil
+    end
+end))
+
+-- re-apply movement features on respawn
+TrackConn(LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(0.6)
+    if Config.NoClip then EnableNoClip() end
+    if Config.Fly then EnableFly() end
+    EnableAntiFallDamage()
+    ApplyCharTweaks()
+    State.lockPos = nil
+end)
+)
+
+task.spawn(function()
+    EnableAntiFallDamage()
+    while true do
+        RunService.RenderStepped:Wait()
+        pcall(function()
+            StayOnRockStep()
+            if Config.WalkSpeedOn or (Config.JumpPower and Config.JumpPower ~= 50) then
+                ApplyCharTweaks()
+            end
+        end)
+    end
+end)
+
+----------------------------------------------------------------------
 -- UPGRADES
 ----------------------------------------------------------------------
 local function AutoUpgrade()
@@ -315,6 +526,53 @@ local function SpamUpgrades()
         State.upgradeSpamRunning = false
         Notify("Spam Upgrades", "Done! 25x upgrades fired", 3)
     end)
+end
+
+----------------------------------------------------------------------
+-- AUTO SELL WHEN BACKPACK IS FULL
+-- (the wiki notes runs end when carry capacity fills, so dump early)
+----------------------------------------------------------------------
+local function GetWeightPair(container)
+    local cur, max
+    for _, v in ipairs(container:GetDescendants()) do
+        if v:IsA("NumberValue") or v:IsA("IntValue") then
+            local n = v.Name:lower()
+            if n:find("weight") or n:find("carry") or n:find("kg") or n:find("capacity") or n:find("load") then
+                if n:find("max") or n:find("limit") then
+                    max = v.Value
+                else
+                    cur = v.Value
+                end
+            end
+        end
+    end
+    return cur, max
+end
+
+local function IsBackpackFull()
+    local player = LocalPlayer
+    local cur, max = GetWeightPair(player)
+    if (not cur or not max) and player.Character then
+        local c2, m2 = GetWeightPair(player.Character)
+        cur = cur or c2; max = max or m2
+    end
+    if cur and max and max > 0 then
+        return cur >= max * 0.97
+    end
+    -- also honor a boolean "full" flag if the game exposes one
+    for _, v in ipairs(player:GetDescendants()) do
+        if v:IsA("BoolValue") and v.Name:lower():find("full") then
+            return v.Value == true
+        end
+    end
+    return false
+end
+
+local function AutoSellIfFull()
+    if not Config.AutoSellFull then return end
+    if IsBackpackFull() then
+        Fire("sell"); Fire("sellall"); Fire("sellcrystals")
+    end
 end
 
 ----------------------------------------------------------------------
@@ -425,6 +683,8 @@ task.spawn(function()
             if Config.AutoSell and math.random(1, 5) == 1 then
                 Fire("sell"); Fire("sellall")
             end
+
+            AutoSellIfFull()
 
             if Config.AutoUpgrade then AutoUpgrade() end
             if Config.AntiFreeze then AntiFreeze() end
@@ -598,12 +858,39 @@ AddToggle("God Mode",                 Config.GodMode,     function(v)
     if v then EnableGodMode() else DisableGodMode() end
 end)
 AddToggle("Auto Upgrade",             Config.AutoUpgrade, function(v) Config.AutoUpgrade = v end)
+AddToggle("Auto Sell When Full",      Config.AutoSellFull, function(v) Config.AutoSellFull = v end)
+
+-- Movement / positioning
+AddToggle("Stay On Rock (No Slide)",  Config.StayOnRock,  function(v) Config.StayOnRock = v end)
+AddToggle("Anti Fall / No Fall Dmg",  Config.AntiFall,    function(v) Config.AntiFall = v end)
+AddToggle("NoClip (Through Mountain)", Config.NoClip,     function(v)
+    Config.NoClip = v
+    if v then EnableNoClip() else DisableNoClip() end
+end)
+AddToggle("Fly (WASD + Space/Ctrl)",  Config.Fly,         function(v)
+    Config.Fly = v
+    if v then EnableFly() else DisableFly() end
+end)
+AddToggle("Infinite Jump",            Config.InfiniteJump, function(v) Config.InfiniteJump = v end)
+AddToggle("Walk Speed Boost",         Config.WalkSpeedOn, function(v)
+    Config.WalkSpeedOn = v
+    if not v then
+        local hum = GetHumanoid()
+        if hum then pcall(function() hum.WalkSpeed = 16 end) end
+    end
+end)
 
 -- Action buttons
-AddButton("TP TO BEST ORE",   Color3.fromRGB(70, 130, 255), TPToBestOre)
+AddButton("TP TO BEST ORE",    Color3.fromRGB(70, 130, 255), TPToBestOre)
 AddButton("SPAM UPGRADES x25", Color3.fromRGB(180, 80, 220), SpamUpgrades)
+AddButton("SELL ALL NOW",      Color3.fromRGB(230, 120, 40), function()
+    Fire("sell"); Fire("sellall"); Fire("sellcrystals")
+    Notify("Sell", "Fired sell / sellall", 2)
+end)
 
 if Config.GodMode then EnableGodMode() end
+if Config.NoClip then EnableNoClip() end
+if Config.Fly then EnableFly() end
 
-print("v11 ready! Press RightShift to hide/show the GUI.")
-Notify("Mine A Mountain v11", "Ready! RightShift = hide/show", 5)
+print("v12 ready! RightShift = hide/show GUI. Fly = WASD + Space/Ctrl.")
+Notify("Mine A Mountain v12", "Ready! Fly + NoClip + Anti-Fall added", 5)
