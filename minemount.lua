@@ -1,4 +1,4 @@
---[[ MINE A MOUNTAIN BOT v12 - Movement Exploits ]]
+--[[ MINE A MOUNTAIN BOT v13 - Full Mechanics ]]
 
 local Players            = game:GetService("Players")
 local RunService         = game:GetService("RunService")
@@ -31,14 +31,19 @@ local Config = {
     FastMine       = true,
     MineSpeedFast  = 50,   -- activations per tick when FastMine is on
     MineSpeedSlow  = 8,    -- activations per tick when FastMine is off
-    MineMaxTime    = 12,   -- max seconds to stay on one rock before giving up
+    MineMaxTime    = 15,   -- max seconds to stay on one rock before giving up
     MineHighestValue = true, -- true = target highest value, false = nearest
-    GrabHoldTime   = 3,    -- seconds to hold the grab/mine prompt
+    GrabHoldTime   = 9,    -- seconds to hold the grab/mine prompt
+    AnchorWhileMining = true, -- freeze the player on the rock (stops shaking)
     ESP            = true,
     ShowValueOnESP = true,
     AntiFreeze     = true,
     GodMode        = false,
     AutoUpgrade    = false,
+
+    -- target selection (populated from the current mountain)
+    OnlySelected   = false,  -- if true, only mine names in SelectedTargets
+    SelectedTargets = {},    -- set: lowercase name -> true
 
     -- movement / positioning
     StayOnRock     = true,   -- lock in place while mining so you don't slide off
@@ -51,6 +56,9 @@ local Config = {
     WalkSpeed      = 60,
     JumpPower      = 50,
     AutoSellFull   = true,   -- auto sell when backpack is full
+
+    -- garden / plot planting
+    GardenValue    = 1000000, -- value of crystal to plant in garden (>= 1M)
 }
 
 local State = {
@@ -69,6 +77,9 @@ local State = {
     flyParts          = {},
     heldKeys          = {},
     lockPos           = nil,   -- CFrame we hold when StayOnRock is active
+    miningActive      = false, -- true while anchored on a rock
+    currentMountain   = "?",   -- detected mountain name
+    targetRows        = {},    -- name -> gui row (targets menu)
 }
 
 local function TrackConn(conn)
@@ -138,17 +149,23 @@ local function SetVelocity(part, vel)
     pcall(function() part.AssemblyLinearVelocity = vel end)
 end
 
-local function TeleportToRock(ore)
+-- teleport the player directly onto the rock/crystal (small lift so we don't
+-- clip into the floor). Anchoring in the mining loop stops the shaking.
+local function TeleportToRock(ore, offsetY)
     local hrp = GetHRP()
     if hrp and ore and ore.Parent then
-        hrp.CFrame = ore.CFrame * CFrame.new(0, 4.8, 0)
+        hrp.CFrame = ore.CFrame * CFrame.new(0, offsetY or 2, 0)
         SetVelocity(hrp, Vector3.zero)
-        -- remember this spot so StayOnRock can hold us here
         State.lockPos = hrp.CFrame
     end
 end
 
-local ORE_KEYWORDS = { "ore", "crystal", "rock", "gem" }
+local function SetAnchored(anchored)
+    local hrp = GetHRP()
+    if hrp then pcall(function() hrp.Anchored = anchored end) end
+end
+
+local ORE_KEYWORDS = { "ore", "crystal", "rock", "gem", "vein", "artifact", "deposit", "mineral" }
 
 local function IsOreName(name)
     name = name:lower()
@@ -158,16 +175,49 @@ local function IsOreName(name)
     return false
 end
 
-local function GetMineableOres()
+-- returns a clean display name for a rock/crystal (strips numbers/junk)
+local function CleanName(obj)
+    local n = obj.Name
+    local model = obj:FindFirstAncestorOfClass("Model")
+    if model and #model.Name > 2 and not tonumber(model.Name) then
+        n = model.Name
+    end
+    return n
+end
+
+local function PassesTargetFilter(obj)
+    if not Config.OnlySelected then return true end
+    if next(Config.SelectedTargets) == nil then return true end
+    return Config.SelectedTargets[CleanName(obj):lower()] == true
+end
+
+local function GetMineableOres(ignoreFilter)
     local ores = {}
     for _, obj in ipairs(Workspace:GetDescendants()) do
         if (obj:IsA("BasePart") or obj:IsA("MeshPart"))
             and obj.Transparency < 1
             and IsOreName(obj.Name) then
-            table.insert(ores, obj)
+            if ignoreFilter or PassesTargetFilter(obj) then
+                table.insert(ores, obj)
+            end
         end
     end
     return ores
+end
+
+-- list distinct rock/crystal names currently on the mountain (for the menu)
+local function GetTargetNames()
+    local seen, list = {}, {}
+    for _, obj in ipairs(GetMineableOres(true)) do
+        local name = CleanName(obj)
+        local key  = name:lower()
+        if not seen[key] then
+            seen[key] = true
+            table.insert(list, name)
+        end
+    end
+    table.sort(list)
+    return list
 end
 
 local function GetValue(obj)
@@ -286,7 +336,7 @@ end
 
 -- Full cycle for one rock/crystal:
 --  1. if backpack full -> go sell, come back
---  2. TP to it and hold the grab prompt (~GrabHoldTime seconds)
+--  2. TP directly onto it, ANCHOR (no shaking), hold the grab prompt (8-10s)
 --  3. mine until its health is depleted / it's gone / timeout
 --  4. final collect sweep so it lands in the backpack
 local function MineAndGrab(ore)
@@ -296,7 +346,10 @@ local function MineAndGrab(ore)
         GoSellAndReturn(ore)
     end
 
-    TeleportToRock(ore)
+    -- TP directly onto the rock and anchor so physics can't shove us around
+    TeleportToRock(ore, 2)
+    State.miningActive = true
+    if Config.AnchorWhileMining then SetAnchored(true) end
     task.wait(0.05)
 
     local speed = CurrentMineSpeed()
@@ -304,10 +357,17 @@ local function MineAndGrab(ore)
     local char  = LocalPlayer.Character
     local tool  = char and char:FindFirstChildOfClass("Tool")
 
-    -- 1) GRAB: hold the prompt for a couple seconds like the game requires
+    local function reseat()
+        -- when anchored we're already frozen on the rock, so don't re-teleport
+        -- (that's what caused the shaking). Only reposition in non-anchor mode.
+        if not Config.AnchorWhileMining then
+            TeleportToRock(ore, 2)
+        end
+    end
+
+    -- 1) GRAB: hold the prompt for GrabHoldTime seconds (8-10s) to start mining
     local grabDeadline = os.clock() + Config.GrabHoldTime
     while ore.Parent and not IsOreGone(ore) and os.clock() < grabDeadline do
-        TeleportToRock(ore)
         TryGrab(ore)
         if tool then pcall(function() tool:Activate() end) end
         task.wait(0.1)
@@ -315,7 +375,7 @@ local function MineAndGrab(ore)
 
     -- 2) MINE until health is basically dead, it's gone, or we time out
     while not IsOreGone(ore) and (os.clock() - start) < Config.MineMaxTime do
-        TeleportToRock(ore)
+        reseat()
         HitOre(ore, tool, speed)
         TryGrab(ore)
 
@@ -324,7 +384,11 @@ local function MineAndGrab(ore)
 
         -- mid-mining weight check: dump if we filled up
         if IsBackpackFull and IsBackpackFull() and GoSellAndReturn then
+            State.miningActive = false
+            SetAnchored(false)
             GoSellAndReturn(ore)
+            State.miningActive = true
+            reseat()
         end
 
         for _ = 1, 4 do
@@ -340,6 +404,9 @@ local function MineAndGrab(ore)
         task.wait(0.06)
     end
 
+    -- release the anchor and move on
+    State.miningActive = false
+    SetAnchored(false)
     return IsOreGone(ore)
 end
 
@@ -485,8 +552,12 @@ end
 ----------------------------------------------------------------------
 local function StayOnRockStep()
     if Config.Fly then return end        -- flying overrides positioning
+    if State.miningActive then return end -- anchored by the mining engine
     local hrp = GetHRP()
     if not hrp then return end
+
+    -- safety: never leave the player stuck-anchored if mining errored out
+    if hrp.Anchored then pcall(function() hrp.Anchored = false end) end
 
     -- Hard lock in place while auto-mining a rock
     if Config.StayOnRock and Config.AutoMine and State.lockPos then
@@ -642,13 +713,45 @@ function IsBackpackFull()
 end
 
 -- find the shop / seller so we can teleport to it when full
-local SELLER_KEYS = { "sell", "shop", "vendor", "trader", "merchant", "seller" }
+local SELLER_KEYS = { "sell", "sellhut", "hut", "shop", "vendor", "trader", "merchant", "seller", "cashier", "counter" }
+local cachedSeller
+
+local function GetPartOf(inst)
+    if not inst then return nil end
+    if inst:IsA("BasePart") then return inst end
+    if inst:IsA("Model") then return inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart", true) end
+    local p = inst.Parent
+    while p and p ~= Workspace do
+        if p:IsA("BasePart") then return p end
+        if p:IsA("Model") and (p.PrimaryPart or p:FindFirstChildWhichIsA("BasePart")) then
+            return p.PrimaryPart or p:FindFirstChildWhichIsA("BasePart")
+        end
+        p = p.Parent
+    end
+    return nil
+end
+
 local function FindSeller()
+    if cachedSeller and cachedSeller.Parent then return cachedSeller end
+    -- 1) a ProximityPrompt whose text mentions selling
+    for _, p in ipairs(Workspace:GetDescendants()) do
+        if p:IsA("ProximityPrompt") then
+            local txt = ((p.ActionText or "") .. " " .. (p.ObjectText or "")):lower()
+            if txt:find("sell") then
+                local part = GetPartOf(p)
+                if part then cachedSeller = part; return part end
+            end
+        end
+    end
+    -- 2) a part / model named like a seller
     for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("BasePart") or obj:IsA("MeshPart") then
+        if obj:IsA("BasePart") or obj:IsA("MeshPart") or obj:IsA("Model") then
             local n = obj.Name:lower()
             for _, kw in ipairs(SELLER_KEYS) do
-                if n:find(kw, 1, true) then return obj end
+                if n:find(kw, 1, true) then
+                    local part = GetPartOf(obj)
+                    if part then cachedSeller = part; return part end
+                end
             end
         end
     end
@@ -656,29 +759,40 @@ local function FindSeller()
 end
 
 local function FireSell(seller)
-    -- try selling the lowest item first, then fall back to sell-all
-    Fire("selllowest"); Fire("sellone"); Fire("sellcheapest")
-    Fire("sell"); Fire("sellall"); Fire("sellcrystals")
+    -- fire the prompt at the hut + every known sell remote name
     if seller then FireGrabPrompt(seller) end
+    Fire("selllowest"); Fire("sellone"); Fire("sellcheapest")
+    Fire("sell"); Fire("sellall"); Fire("sellcrystals"); Fire("sellinventory")
+    Fire("sellbackpack"); Fire("cashout")
 end
 
--- assigns to the forward-declared local. TP to seller, sell to free weight,
--- then TP back to where we were mining and resume.
+-- assigns to the forward-declared local. TP to the sell hut, sell to free
+-- weight, then TP back to where we were mining and resume.
 function GoSellAndReturn(returnOre)
     local hrp = GetHRP()
     if not hrp then return end
+    SetAnchored(false)
     local backCFrame = State.lockPos or hrp.CFrame
-    Notify("Backpack Full", "Teleporting to seller...", 2)
+    Notify("Backpack Full", "Teleporting to sell hut...", 2)
 
     local seller = FindSeller()
-    for _ = 1, 22 do
-        if seller and seller.Parent then
-            hrp.CFrame = seller.CFrame * CFrame.new(0, 4, 5)
-            SetVelocity(hrp, Vector3.zero)
+    if not seller then
+        -- no hut found: just sell in place
+        for _ = 1, 8 do
+            FireSell(nil)
+            task.wait(0.1)
+            if not IsBackpackFull() then break end
         end
-        FireSell(seller)
-        task.wait(0.15)
-        if not IsBackpackFull() then break end
+    else
+        for _ = 1, 25 do
+            if seller and seller.Parent then
+                hrp.CFrame = seller.CFrame * CFrame.new(0, 3, 4)
+                SetVelocity(hrp, Vector3.zero)
+            end
+            FireSell(seller)
+            task.wait(0.12)
+            if not IsBackpackFull() then break end
+        end
     end
 
     -- go back to the rock we were working on
@@ -697,6 +811,107 @@ local function AutoSellIfFull()
             FireSell(nil)       -- just fire sell remotes in place
         end
     end
+end
+
+----------------------------------------------------------------------
+-- GAME FEATURES / EXPLOITS (based on the wiki mechanics)
+----------------------------------------------------------------------
+
+-- Pickaxes (best -> worst). Buying tries to grab/equip the strongest.
+local PICKAXES = {
+    "Celestial Apex", "Tempest Pick", "Obsidian Edge", "Volcano Basalt",
+    "Emerald Carver", "Frostbite Pick", "Titanium Spike", "Reinforced Steel",
+    "Copper Pick", "Hardened Iron", "Chipped Stone", "Weathered Wood",
+    "Rusty Scrapper", "Diamond Pickaxe",
+}
+local function BuyPickaxe(name)
+    Fire("buypickaxe", name); Fire("purchasepickaxe", name)
+    Fire("buy", name); Fire("equippickaxe", name); Fire("equip", name)
+end
+local function BuyBestPickaxe()
+    for _, p in ipairs(PICKAXES) do BuyPickaxe(p) end
+    Notify("Pickaxe", "Tried to buy + equip the best pickaxe", 3)
+end
+
+-- Bombs (best -> worst)
+local BOMBS = {
+    "Agony Bomb", "Time Bomb", "Poison Bomb", "Thunder Bomb",
+    "Fire Bomb", "Ice Bomb", "Wind Bomb", "Classic Bomb",
+}
+local function BuyBomb(name)
+    Fire("buybomb", name); Fire("purchasebomb", name); Fire("buy", name)
+end
+local function ThrowBomb(name)
+    local hrp = GetHRP()
+    local pos = hrp and hrp.Position
+    Fire("throwbomb", name, pos); Fire("usebomb", name, pos)
+    Fire("detonate", name, pos); Fire("placebomb", name, pos); Fire("bomb", name, pos)
+end
+local function BuyAndThrowBestBomb()
+    local best = BOMBS[1]
+    BuyBomb(best)
+    task.wait(0.2)
+    ThrowBomb(best)
+    Notify("Bomb", "Bought + threw " .. best, 3)
+end
+
+-- Upgrades: warmth (climb higher) + carry weight (backpack)
+local function MaxWarmth()
+    for _ = 1, 40 do
+        Fire("upgradewarmth"); Fire("buyupgrade", "Warmth"); Fire("buywarmth")
+        task.wait(0.04)
+    end
+    Notify("Warmth", "Maxed warmth upgrades", 3)
+end
+local function MaxCarry()
+    for _ = 1, 40 do
+        Fire("upgradebackpack"); Fire("buyupgrade", "Backpack")
+        Fire("buyupgrade", "Carry"); Fire("upgradecarry")
+        task.wait(0.04)
+    end
+    Notify("Carry", "Maxed carry weight", 3)
+end
+
+-- Spawn a specific mountain rarity (the game normally charges Robux)
+local MOUNTAIN_RARITIES = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic" }
+local function SpawnMountain(rarity)
+    Fire("spawnmountain", rarity); Fire("buymountain", rarity)
+    Fire("newmountain", rarity); Fire("generatemountain", rarity)
+    Fire("rerollmountain", rarity)
+    Notify("Mountain", "Requested a " .. rarity .. " mountain", 3)
+end
+
+-- Plant a crystal/rock of a chosen value in your garden plot
+local function PlantInGarden(value)
+    value = value or Config.GardenValue
+    Fire("plant", value); Fire("plantcrystal", value); Fire("placecrystal", value)
+    Fire("placeplot", value); Fire("addplot", value); Fire("garden", value)
+    Fire("plantseed", value); Fire("place", value); Fire("plotplace", value)
+    Notify("Garden", "Tried to plant a crystal worth $" .. tostring(value), 3)
+end
+
+-- Detect the current mountain (changes hourly)
+local MOUNTAIN_NAMES = {
+    "Stepped Mesa", "Sprawling Massif", "Badlands Pinnacles", "Active Volcano",
+    "Karst Spire", "Twin Peaks", "Frosthorn", "Bonewhite", "Dolomite Spires",
+    "Obsidian Crag", "Lone Spire", "Thornspire", "Crystal Peak", "The Maw",
+    "Everest", "K2",
+}
+local function DetectMountain()
+    for _, v in ipairs(Workspace:GetChildren()) do
+        for _, m in ipairs(MOUNTAIN_NAMES) do
+            if v.Name == m or v.Name:lower():find(m:lower(), 1, true) then
+                return m
+            end
+        end
+    end
+    -- value/attribute fallback
+    for _, v in ipairs(Workspace:GetDescendants()) do
+        if v:IsA("StringValue") and v.Name:lower():find("mountain") then
+            return v.Value
+        end
+    end
+    return "Unknown"
 end
 
 ----------------------------------------------------------------------
@@ -903,7 +1118,7 @@ SubTitle.Size                   = UDim2.new(1, -60, 0, 14)
 SubTitle.Position               = UDim2.new(0, 14, 0, 24)
 SubTitle.BackgroundTransparency = 1
 SubTitle.TextXAlignment         = Enum.TextXAlignment.Left
-SubTitle.Text                   = "v12 - RightShift to hide"
+SubTitle.Text                   = "v13 - RightShift to hide"
 SubTitle.TextColor3             = SUB
 SubTitle.TextSize               = 11
 SubTitle.Font                   = Enum.Font.Gotham
@@ -933,11 +1148,15 @@ Line.BorderSizePixel  = 0
 Line.Parent           = Main
 
 -- sidebar
-local Side = Instance.new("Frame")
+local Side = Instance.new("ScrollingFrame")
 Side.Size             = UDim2.new(0, 132, 1, -44)
 Side.Position         = UDim2.new(0, 0, 0, 44)
 Side.BackgroundColor3 = PANEL
 Side.BorderSizePixel  = 0
+Side.ScrollBarThickness = 3
+Side.ScrollBarImageColor3 = ACCENT
+Side.CanvasSize       = UDim2.new(0, 0, 0, 0)
+Side.AutomaticCanvasSize = Enum.AutomaticSize.Y
 Side.Parent           = Main
 
 local SideList = Instance.new("UIListLayout")
@@ -945,7 +1164,7 @@ SideList.SortOrder = Enum.SortOrder.LayoutOrder
 SideList.Padding   = UDim.new(0, 2)
 SideList.Parent    = Side
 local SidePad = Instance.new("UIPadding", Side)
-SidePad.PaddingTop = UDim.new(0, 8)
+SidePad.PaddingTop = UDim.new(0, 8); SidePad.PaddingBottom = UDim.new(0, 8)
 
 -- content area
 local Content = Instance.new("Frame")
@@ -1237,6 +1456,88 @@ local function AddSlider(parent, text, min, max, default, cb)
     end))
 end
 
+local function AddLabel(parent, text)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size                   = UDim2.new(1, 0, 0, 20)
+    lbl.BackgroundTransparency = 1
+    lbl.TextXAlignment         = Enum.TextXAlignment.Left
+    lbl.Text                   = text
+    lbl.TextColor3             = SUB
+    lbl.TextSize               = 12
+    lbl.Font                   = Enum.Font.Gotham
+    lbl.Parent                 = parent
+    return lbl
+end
+
+local function AddInput(parent, placeholder, default, cb)
+    local box = Instance.new("Frame")
+    box.Size             = UDim2.new(1, 0, 0, 34)
+    box.BackgroundColor3 = ROW
+    box.BorderSizePixel  = 0
+    box.Parent           = parent
+    corner(box, 8)
+
+    local tb = Instance.new("TextBox")
+    tb.Size                   = UDim2.new(1, -16, 1, 0)
+    tb.Position               = UDim2.new(0, 8, 0, 0)
+    tb.BackgroundTransparency = 1
+    tb.TextXAlignment         = Enum.TextXAlignment.Left
+    tb.PlaceholderText        = placeholder
+    tb.Text                   = tostring(default or "")
+    tb.TextColor3             = TXT
+    tb.PlaceholderColor3      = SUB
+    tb.TextSize               = 13
+    tb.Font                   = Enum.Font.GothamMedium
+    tb.ClearTextOnFocus       = false
+    tb.Parent                 = box
+    tb.FocusLost:Connect(function()
+        if cb then cb(tb.Text) end
+    end)
+    return tb
+end
+
+-- checkbox row bound to the Config.SelectedTargets set
+local function AddTargetRow(parent, name)
+    local key = name:lower()
+    local btn = Instance.new("TextButton")
+    btn.Size             = UDim2.new(1, 0, 0, 30)
+    btn.BackgroundColor3 = ROW
+    btn.AutoButtonColor  = false
+    btn.Text             = ""
+    btn.Parent           = parent
+    corner(btn, 7)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size                   = UDim2.new(1, -40, 1, 0)
+    lbl.Position               = UDim2.new(0, 10, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.TextXAlignment         = Enum.TextXAlignment.Left
+    lbl.Text                   = name
+    lbl.TextColor3             = TXT
+    lbl.TextSize               = 12
+    lbl.Font                   = Enum.Font.GothamMedium
+    lbl.TextTruncate           = Enum.TextTruncate.AtEnd
+    lbl.Parent                 = btn
+
+    local box = Instance.new("Frame")
+    box.Size             = UDim2.new(0, 16, 0, 16)
+    box.Position         = UDim2.new(1, -26, 0.5, -8)
+    box.BackgroundColor3 = Config.SelectedTargets[key] and ACCENT or ROWOFF
+    box.BorderSizePixel  = 0
+    box.Parent           = btn
+    corner(box, 4)
+
+    btn.MouseButton1Click:Connect(function()
+        if Config.SelectedTargets[key] then
+            Config.SelectedTargets[key] = nil
+            box.BackgroundColor3 = ROWOFF
+        else
+            Config.SelectedTargets[key] = true
+            box.BackgroundColor3 = ACCENT
+        end
+    end)
+end
+
 ----------------------------------------------------------------------
 -- pages / content
 ----------------------------------------------------------------------
@@ -1246,8 +1547,9 @@ AddToggle(pMine, "Auto Mine (Smart Target)", Config.AutoMine,    function(v) Con
 AddToggle(pMine, "Mine Highest Value First",  Config.MineHighestValue, function(v) Config.MineHighestValue = v end)
 AddToggle(pMine, "Auto Pickup (Grab)",       Config.AutoCollect, function(v) Config.AutoCollect = v end)
 AddToggle(pMine, "Super Fast Mining",        Config.FastMine,    function(v) Config.FastMine = v end)
-AddSlider(pMine, "Grab Hold (sec)", 1, 6, Config.GrabHoldTime, function(v) Config.GrabHoldTime = v end)
-AddSlider(pMine, "Max Time / Rock",  4, 30, Config.MineMaxTime, function(v) Config.MineMaxTime = v end)
+AddToggle(pMine, "Anchor While Mining (No Shake)", Config.AnchorWhileMining, function(v) Config.AnchorWhileMining = v end)
+AddSlider(pMine, "Grab Hold (sec)", 1, 12, Config.GrabHoldTime, function(v) Config.GrabHoldTime = v end)
+AddSlider(pMine, "Max Time / Rock",  4, 40, Config.MineMaxTime, function(v) Config.MineMaxTime = v end)
 Section(pMine, "Selling")
 AddToggle(pMine, "Auto Sell",                Config.AutoSell,    function(v) Config.AutoSell = v end)
 AddToggle(pMine, "Auto Sell When Full",      Config.AutoSellFull, function(v) Config.AutoSellFull = v end)
@@ -1294,18 +1596,91 @@ AddToggle(pPlayer, "God Mode",               Config.GodMode,     function(v)
     if v then EnableGodMode() else DisableGodMode() end
 end)
 
+-- Targets menu: pick which rocks / crystals to mine (updates hourly)
+local pTargets = AddTab("Targets", "Pick rocks")
+Section(pTargets, "Current Mountain")
+local MountainLabel = AddLabel(pTargets, "Mountain: scanning...")
+AddToggle(pTargets, "Only Mine Selected", Config.OnlySelected, function(v) Config.OnlySelected = v end)
+
+local TargetsListSection = Instance.new("Frame")
+TargetsListSection.Size = UDim2.new(1, 0, 0, 0)
+TargetsListSection.AutomaticSize = Enum.AutomaticSize.Y
+TargetsListSection.BackgroundTransparency = 1
+TargetsListSection.Parent = pTargets
+local tlLayout = Instance.new("UIListLayout")
+tlLayout.SortOrder = Enum.SortOrder.LayoutOrder
+tlLayout.Padding = UDim.new(0, 4)
+tlLayout.Parent = TargetsListSection
+
+local function RebuildTargets()
+    for _, c in ipairs(TargetsListSection:GetChildren()) do
+        if not c:IsA("UIListLayout") then c:Destroy() end
+    end
+    State.currentMountain = DetectMountain()
+    MountainLabel.Text = "Mountain: " .. State.currentMountain
+    local names = GetTargetNames()
+    if #names == 0 then
+        AddLabel(TargetsListSection, "No rocks/crystals detected yet.")
+    else
+        for _, n in ipairs(names) do
+            AddTargetRow(TargetsListSection, n)
+        end
+    end
+end
+
+Section(pTargets, "List")
+AddButton(pTargets, "REFRESH LIST", ACCENT, RebuildTargets)
+
+-- Shop / exploits: pickaxes, bombs, upgrades, mountains, garden
+local pShop = AddTab("Shop", "Exploits")
+Section(pShop, "Gear")
+AddButton(pShop, "BUY BEST PICKAXE", Color3.fromRGB(70, 130, 255), BuyBestPickaxe)
+AddButton(pShop, "MAX WARMTH",       Color3.fromRGB(90, 160, 255), MaxWarmth)
+AddButton(pShop, "MAX CARRY WEIGHT", Color3.fromRGB(90, 160, 255), MaxCarry)
+Section(pShop, "Bombs (mutations)")
+AddButton(pShop, "BUY + THROW BEST BOMB", Color3.fromRGB(220, 90, 60), BuyAndThrowBestBomb)
+AddButton(pShop, "THROW AGONY BOMB", Color3.fromRGB(180, 60, 90), function() ThrowBomb("Agony Bomb") end)
+Section(pShop, "Spawn Mountain")
+AddButton(pShop, "SPAWN MYTHIC",    Color3.fromRGB(200, 80, 220), function() SpawnMountain("Mythic") end)
+AddButton(pShop, "SPAWN LEGENDARY", Color3.fromRGB(160, 100, 220), function() SpawnMountain("Legendary") end)
+Section(pShop, "Garden Plant")
+AddInput(pShop, "Crystal value (>= 1000000)", Config.GardenValue, function(txt)
+    local v = tonumber((txt:gsub("[^%d]", "")))
+    if v and v >= 1 then Config.GardenValue = v end
+end)
+AddButton(pShop, "PLANT CRYSTAL IN GARDEN", Color3.fromRGB(60, 190, 120), function()
+    PlantInGarden(Config.GardenValue)
+end)
+
 local pActions = AddTab("Actions", "TP, upgrades")
 Section(pActions, "Teleport")
 AddButton(pActions, "TP TO BEST ORE", Color3.fromRGB(70, 130, 255), TPToBestOre)
+AddButton(pActions, "SELL ALL NOW", Color3.fromRGB(230, 120, 40), function()
+    if GoSellAndReturn then GoSellAndReturn() else FireSell(nil) end
+end)
 Section(pActions, "Upgrades")
 AddToggle(pActions, "Auto Upgrade",          Config.AutoUpgrade, function(v) Config.AutoUpgrade = v end)
 AddButton(pActions, "SPAM UPGRADES x25", Color3.fromRGB(180, 80, 220), SpamUpgrades)
 
+RebuildTargets()
 SelectTab("Mining")
+
+-- auto-refresh the targets list when the mountain changes (hourly rotate)
+task.spawn(function()
+    while true do
+        task.wait(30)
+        pcall(function()
+            local m = DetectMountain()
+            if m ~= State.currentMountain then
+                RebuildTargets()
+            end
+        end)
+    end
+end)
 
 if Config.GodMode then EnableGodMode() end
 if Config.NoClip then EnableNoClip() end
 if Config.Fly then EnableFly() end
 
-print("v12 ready! RightShift = hide/show GUI. Fly = WASD + Space/Ctrl.")
-Notify("Mine A Mountain v12", "New compact hub UI loaded", 5)
+print("v13 ready! RightShift = hide/show GUI. Fly = WASD + Space/Ctrl.")
+Notify("Mine A Mountain v13", "Targets menu + Shop exploits added", 5)
